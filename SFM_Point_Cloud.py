@@ -99,7 +99,7 @@ F_list, mask_list, pair_masks = estimate_F_for_pairs(
 # 6. Visualize Epipolar Geometry
 # --------------------------------------------------------------
 
-# visualize_first_valid_fundamental(pairs, pair_masks, images, all_keypoints)
+visualize_first_valid_fundamental(pairs, pair_masks, images, all_keypoints)
 
 # --------------------------------------------------------------
 # Sanity Checks - number of good pairs, mean, min, max and median

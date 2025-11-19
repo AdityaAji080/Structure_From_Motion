@@ -48,7 +48,7 @@ class PairMatch:
 # =====================
 
 def estimate_intrinsics_from_image(gray):
-    """Very rough intrinsics guess. Replace with real K if you know it."""
+    """Rough Estimation of Intrinsics K"""
     h, w = gray.shape
     f = 1.2 * max(w, h)
     K = np.array([[f, 0, w / 2.0],
@@ -143,13 +143,48 @@ def load_images(image_dir, ext="*.jpg"):
     return images
 
 
-def save_points_to_ply(filename, tracks):
-    pts = [track.point3d for track in tracks if track.point3d is not None]
-    print(f"Saving {len(pts)} 3D points to {filename}")
+def save_points_to_ply(filename, tracks, images):
+    """
+    Save 3D points to a PLY file, coloring each point from the original images.
+
+    For each track:
+      - Take its first observation (image_id, keypoint_index).
+      - Use the keypoint's (u, v) pixel location.
+      - Sample the BGR color from the corresponding image.
+      - Write XYZ + RGB (converted to RGB order) to the PLY.
+    """
+    pts_colors = []
+
+    for track in tracks:
+        if track.point3d is None:
+            continue
+        if not track.observations:
+            continue
+
+        # Take the first observation for color
+        img_id, kp_idx = track.observations[0]
+        img = images[img_id].image      # BGR image from cv2
+        kp = images[img_id].keypoints[kp_idx]
+        u, v = kp.pt  # (x, y) in float
+
+        # Convert to integer pixel coordinates, clamp to valid range
+        h, w = img.shape[:2]
+        u_i = int(round(u))
+        v_i = int(round(v))
+        u_i = max(0, min(w - 1, u_i))
+        v_i = max(0, min(h - 1, v_i))
+
+        # OpenCV is BGR; PLY expects RGB
+        b, g, r = img[v_i, u_i]
+
+        pts_colors.append((track.point3d, (int(r), int(g), int(b))))
+
+    print(f"Saving {len(pts_colors)} 3D points with color to {filename}")
+
     with open(filename, "w") as f:
         f.write("ply\n")
         f.write("format ascii 1.0\n")
-        f.write(f"element vertex {len(pts)}\n")
+        f.write(f"element vertex {len(pts_colors)}\n")
         f.write("property float x\n")
         f.write("property float y\n")
         f.write("property float z\n")
@@ -157,9 +192,10 @@ def save_points_to_ply(filename, tracks):
         f.write("property uchar green\n")
         f.write("property uchar blue\n")
         f.write("end_header\n")
-        for X in pts:
+        for X, (r, g, b) in pts_colors:
             x, y, z = X
-            f.write(f"{x} {y} {z} 255 255 255\n")
+            f.write(f"{x} {y} {z} {r} {g} {b}\n")
+
 
 
 # =====================
@@ -168,7 +204,7 @@ def save_points_to_ply(filename, tracks):
 
 def extract_features(images):
     sift = cv2.SIFT_create(
-        nfeatures=8000,
+        nfeatures= 15000,
         contrastThreshold=0.02,  # lower = more keypoints in low-texture regions
         edgeThreshold=10
     )
@@ -183,7 +219,7 @@ def extract_features(images):
 #  Matching + Geometric Verification
 # =====================
 
-def match_image_pairs(images, max_neighbors=10, ratio=0.8, min_matches=20):
+def match_image_pairs(images, max_neighbors=4, ratio=0.8, min_matches=30):
     """
     Match each image i to neighbors j in [i+1, i+max_neighbors].
     """
@@ -331,12 +367,42 @@ def build_tracks(images, verified_pairs):
 #  Incremental Reconstruction
 # =====================
 
-def choose_initial_pair(verified_pairs):
-    """Pick pair with max inliers."""
-    if not verified_pairs:
-        return None
-    best_key = max(verified_pairs, key=lambda k: len(verified_pairs[k].inlier_matches))
-    return verified_pairs[best_key]
+def choose_initial_pair(verified_pairs, images, K):
+    best_score = -1
+    best_pm = None
+
+    for (i, j), pm in verified_pairs.items():
+        kp1 = images[i].keypoints
+        kp2 = images[j].keypoints
+
+        pts1 = np.array([kp1[m.queryIdx].pt for m in pm.inlier_matches],
+                        dtype=np.float64)
+        pts2 = np.array([kp2[m.trainIdx].pt for m in pm.inlier_matches],
+                        dtype=np.float64)
+
+        if len(pts1) < 50:
+            continue
+
+        E, _ = cv2.findEssentialMat(
+            pts1, pts2, K,
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=1.0
+        )
+        if E is None:
+            continue
+
+        _, R, t, mask_pose = cv2.recoverPose(E, pts1, pts2, K)
+        num_pose_inliers = int(mask_pose.sum())
+        baseline = float(np.linalg.norm(t))
+
+        score = num_pose_inliers * baseline
+        if score > best_score:
+            best_score = score
+            best_pm = pm
+
+    print(f"Chosen seed pair {best_pm.i}-{best_pm.j} with score {best_score}")
+    return best_pm
 
 
 def initialize_two_view_reconstruction(seed_pair, images, K):
@@ -571,15 +637,6 @@ def tracks_to_open3d_pcd(tracks):
 
     return pcd
 
-
-def visualize_tracks_with_open3d(tracks):
-    pcd = tracks_to_open3d_pcd(tracks)
-    if pcd is None:
-        return
-    o3d.visualization.draw_geometries([pcd])
-
-
-
 def bundle_adjust_points(images, tracks, K,
                          min_obs_per_track=2,
                          max_iterations=25,
@@ -720,3 +777,41 @@ def bundle_adjust_points(images, tracks, K,
     kept = len(active_track_indices) - removed_outliers
     print(f"[BA] Done. Kept {kept} points, removed {removed_outliers} outliers "
           f"(outlier_thresh={outlier_thresh} px)")
+
+
+def load_middlebury_par(par_path):
+    """
+    Load Middlebury *SparseRing camera parameters.
+
+    Each line in par file:
+    imgname.png k11 k12 k13 k21 k22 k23 k31 k32 k33 r11 ... r33 t1 t2 t3
+
+    Returns:
+        cam_dict: {imgname: {"K": K, "R": R, "t": t}}
+    """
+    cam_dict = {}
+    with open(par_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            img_name = parts[0]
+            vals = list(map(float, parts[1:]))
+
+            if len(vals) != 3*3 + 3*3 + 3:
+                print(f"Unexpected line format in {par_path}: {line}")
+                continue
+
+            K_vals = vals[0:9]
+            R_vals = vals[9:18]
+            t_vals = vals[18:21]
+
+            K = np.array(K_vals, dtype=np.float64).reshape(3, 3)
+            R = np.array(R_vals, dtype=np.float64).reshape(3, 3)
+            t = np.array(t_vals, dtype=np.float64).reshape(3, 1)
+
+            cam_dict[img_name] = {"K": K, "R": R, "t": t}
+
+    print(f"Loaded {len(cam_dict)} camera entries from {par_path}")
+    return cam_dict
