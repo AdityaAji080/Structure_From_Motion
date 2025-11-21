@@ -4,6 +4,8 @@ import cv2
 import numpy as np
 import open3d as o3d
 from scipy.optimize import least_squares
+from scipy.sparse import lil_matrix
+
 
 # =====================
 #  Basic Data Classes
@@ -155,10 +157,14 @@ def save_points_to_ply(filename, tracks, images):
     """
     pts_colors = []
 
+    MAX_SAVE_ERROR = 2.0  # px
+
     for track in tracks:
-        if track.point3d is None:
+        if track.point3d is None or not track.observations:
             continue
-        if not track.observations:
+
+        # If you’ve run BA and track.error is set, filter by it
+        if track.error is not None and track.error > MAX_SAVE_ERROR:
             continue
 
         # Take the first observation for color
@@ -204,7 +210,7 @@ def save_points_to_ply(filename, tracks, images):
 
 def extract_features(images):
     sift = cv2.SIFT_create(
-        nfeatures= 15000,
+        nfeatures= 0,
         contrastThreshold=0.02,  # lower = more keypoints in low-texture regions
         edgeThreshold=10
     )
@@ -219,7 +225,7 @@ def extract_features(images):
 #  Matching + Geometric Verification
 # =====================
 
-def match_image_pairs(images, max_neighbors=4, ratio=0.8, min_matches=30):
+def match_image_pairs(images, max_neighbors=3, ratio=0.8, min_matches=30):
     """
     Match each image i to neighbors j in [i+1, i+max_neighbors].
     """
@@ -256,7 +262,7 @@ def match_image_pairs(images, max_neighbors=4, ratio=0.8, min_matches=30):
 
 
 def geometric_verification(pair_matches, images, K,
-                           ransac_thresh=1.5, min_inliers=30):
+                           ransac_thresh=1.0, min_inliers=60):
     """
     For each matched pair, estimate Essential matrix with RANSAC and keep only inlier matches.
     """
@@ -577,7 +583,7 @@ def triangulate_new_points_for_image(new_img_id, images, tracks, K,
 
     print(f"Triangulated {count} new points using image {new_img_id}")
 
-def triangulate_all_tracks(images, tracks, K, reproj_error_thresh=3.0):
+def triangulate_all_tracks(images, tracks, K, reproj_error_thresh=2.0):
     """
     After all images are registered, try to triangulate every track using
     ANY pair of registered images that see it.
@@ -692,42 +698,49 @@ def bundle_adjust_points(images, tracks, K,
     print(f"[BA] Total observations: {len(obs_list)} "
           f"(residual dim = {2 * len(obs_list)})")
 
-    # 4) Initial parameter vector: all 3D points stacked
+    # 4) Build Jacobian sparsity pattern for point-only BA
+    m = 2 * len(obs_list)                     # number of residuals
+    n = 3 * len(active_track_indices)        # number of params (3 per point)
+    J_sparsity = lil_matrix((m, n), dtype=int)
+
+    for obs_idx, (p_idx, iid, kp_idx) in enumerate(obs_list):
+        # p_idx is the local index of the point (0 .. n_points-1)
+        j0 = 3 * p_idx
+        # Each observation gives 2 residuals depending on this point's 3 coords
+        J_sparsity[2 * obs_idx,     j0:j0+3] = 1
+        J_sparsity[2 * obs_idx + 1, j0:j0+3] = 1
+
+
+    # 5) Initial parameter vector: all 3D points stacked
     x0 = np.zeros(3 * len(active_track_indices), dtype=np.float64)
     for local_idx, ti in enumerate(active_track_indices):
         x0[3 * local_idx:3 * local_idx + 3] = tracks[ti].point3d
 
-    # 5) Residual function with FIXED length
+    # 6) Residual function with FIXED length
     def residuals(params):
-        # residuals vector: 2 values per observation (u and v)
         res = np.zeros(2 * len(obs_list), dtype=np.float64)
-
         for obs_idx, (p_idx, iid, kp_idx) in enumerate(obs_list):
             X = params[3 * p_idx:3 * p_idx + 3].reshape(3, 1)
-
             img = images[iid]
             kp = img.keypoints[kp_idx].pt
             x_meas = np.array(kp, dtype=np.float64).reshape(2, 1)
-
             x_proj = project_point(K, img.R, img.t, X)
-
-            # If projection fails (e.g., point behind camera), just leave
-            # residuals as 0 for this obs. That way the length stays constant.
             if x_proj is None or not np.isfinite(x_proj).all():
                 continue
-
-            res[2 * obs_idx] = x_proj[0, 0] - x_meas[0, 0]
+            res[2 * obs_idx]     = x_proj[0, 0] - x_meas[0, 0]
             res[2 * obs_idx + 1] = x_proj[1, 0] - x_meas[1, 0]
-
         return res
 
-    # 6) Run optimization
+
+    # 7) Run optimization with sparse Jacobian
     result = least_squares(
         residuals,
         x0,
-        method="lm",          # or "trf" if you prefer; both are fine here
+        method="trf",               # MUST be 'trf' or 'dogbox' for jac_sparsity
+        jac_sparsity=J_sparsity,
         max_nfev=max_iterations
     )
+
 
     print(f"[BA] Optimization success: {result.success}, "
           f"message: {result.message}")
@@ -815,3 +828,4 @@ def load_middlebury_par(par_path):
 
     print(f"Loaded {len(cam_dict)} camera entries from {par_path}")
     return cam_dict
+
